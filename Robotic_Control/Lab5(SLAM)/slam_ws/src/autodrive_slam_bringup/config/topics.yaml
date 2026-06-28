@@ -1,0 +1,53 @@
+# =============================================================================
+# topics.yaml
+#
+# SINGLE SOURCE OF TRUTH for AutoDRIVE <-> ROS 2 topic names.
+#
+# WHY THIS FILE EXISTS:
+# The AutoDRIVE Simulator's ROS 2 bridge (autodrive_f1tenth package) publishes
+# and subscribes to topics that can vary slightly between AutoDRIVE releases
+# (e.g. "/autodrive/f1tenth_1/lidar" vs "/autodrive/f1tenth_1/lidar_scan").
+#
+# HOW TO USE:
+#   1. Install + launch AutoDRIVE Simulator and its ROS 2 bridge as normal.
+#   2. In a new terminal: `ros2 topic list`
+#   3. Find the actual LiDAR, throttle, and steering topic names published/
+#      subscribed by the autodrive_f1tenth bridge node.
+#   4. Edit the values below to match EXACTLY what you see.
+#   5. Re-run `colcon build` (or just `ros2 launch ...` again if you only
+#      edited this file and used --symlink-install).
+#
+# Everything downstream (the adapter node, slam_toolbox, teleop) reads
+# topic names from here via the adapter node's parameters - you should
+# never need to hunt through multiple files.
+# =============================================================================
+
+autodrive_adapter_node:
+  ros__parameters:
+    # ---- INCOMING from AutoDRIVE Simulator bridge ----
+    autodrive_lidar_topic: "/autodrive/f1tenth_1/lidar"
+    autodrive_imu_topic: "/autodrive/f1tenth_1/imu"
+    autodrive_left_encoder_topic: "/autodrive/f1tenth_1/left_encoder"
+    autodrive_right_encoder_topic: "/autodrive/f1tenth_1/right_encoder"
+    autodrive_ips_topic: "/autodrive/f1tenth_1/ips"            # ground-truth position (sim only)
+
+    # ---- OUTGOING to AutoDRIVE Simulator bridge (vehicle actuation) ----
+    autodrive_throttle_topic: "/autodrive/f1tenth_1/throttle_command"
+    autodrive_steering_topic: "/autodrive/f1tenth_1/steering_command"
+
+    # ---- NORMALIZED topics this adapter publishes for the rest of the stack ----
+    scan_topic: "/scan"                  # sensor_msgs/LaserScan -> consumed by slam_toolbox
+    odom_topic: "/odom"                  # nav_msgs/Odometry     -> consumed by slam_toolbox
+    drive_topic: "/drive"                # ackermann_msgs/AckermannDriveStamped -> consumed by adapter
+
+    # ---- Frames (must match a consistent TF tree) ----
+    base_frame: "base_link"
+    odom_frame: "odom"
+    laser_frame: "laser"
+
+    # ---- Vehicle geometry (F1TENTH default; edit if your car differs) ----
+    wheelbase: 0.3302        # meters, distance between front and rear axles
+    max_steering_angle: 0.4189   # radians (~24 deg), F1TENTH default servo limit
+    max_throttle: 1.0         # normalized AutoDRIVE throttle command range [-1, 1]
+
+    publish_tf: true
