@@ -1,6 +1,9 @@
 # F1-Tenth-URI
 Welcome to F1-Tenth!
-This is the GitHub this we use for this club. We will be useing this to manage tasks and to share information.
+This is the GitHub this we use for this club. 
+
+We will be useing this to manage tasks and to share information.
+
 Below is a guide on how to use Github.
 
 ## 1. One-Time Setup
