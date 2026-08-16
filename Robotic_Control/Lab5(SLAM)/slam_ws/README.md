@@ -1,4 +1,5 @@
-# AutoDRIVE F1TENTH SLAM Workspace
+ros2 service call /slam_toolbox/serialize_map slam_toolbox/srv/SerializePoseGraph \
+  "{filename: '/home/texdrew/my_map'}"# AutoDRIVE F1TENTH SLAM Workspace
 
 A ROS 2 (Humble) workspace that runs live SLAM (`slam_toolbox`) against the
 [AutoDRIVE Simulator](https://autodrive-ecosystem.github.io)'s F1TENTH vehicle.

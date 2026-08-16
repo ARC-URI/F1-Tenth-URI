@@ -24,7 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'pure_pursuit = p_pursuit.pure_pursuit:main'
+            'pure_pursuit = p_pursuit.pure_pursuit:main',
+            'centerline = p_pursuit.centerline:main',
+            
         ],
     },
 )

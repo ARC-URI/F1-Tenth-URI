@@ -31,7 +31,9 @@ slam_toolbox:
     base_frame: base_link
     scan_topic: /scan
     use_map_saver: true
-    mode: mapping             # "mapping" while SLAMing; switch to "localization" once you have a saved map
+    mode: localization
+    map_file_name: /home/texdrew/my_map
+    map_start_at_dock: true
 
     # If you run multiple AutoDRIVE vehicles, set a distinct map_frame per robot
     # and remap accordingly in the launch file.
