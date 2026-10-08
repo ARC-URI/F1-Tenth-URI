@@ -44,6 +44,18 @@ LIDAR_ANGLES = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, LIDAR_NUM_RAYS)
 # Speed normalization constant (approximate max speed in CarRacing)
 MAX_SPEED = 50.0
 
+# Leaving the road ends the episode with this penalty, so the track edges act like walls
+OFF_TRACK_PENALTY = 20.0
+
+# Approximate Box2D units per metre (CarRacing car ~5 units long, F1TENTH car ~0.5 m).
+# Not used in training; the deployment node needs it to convert metres to Box2D units.
+UNITS_PER_METER = 10.0
+
+
+def car_heading(car):
+    """World heading of the car in radians. The hull's forward axis is local +y."""
+    return car.hull.angle + math.pi / 2
+
 
 def compute_track_boundaries(track):
     """Convert track centerline into left/right boundary line segments.
@@ -60,11 +72,12 @@ def compute_track_boundaries(track):
     right_points = np.zeros((n, 2))
 
     for i, (alpha, beta, cx, cy) in enumerate(track):
-        # Offset perpendicular to track direction (beta is the heading angle)
-        dx = TRACK_WIDTH * math.cos(beta + math.pi / 2)
-        dy = TRACK_WIDTH * math.sin(beta + math.pi / 2)
-        left_points[i] = [cx + dx, cy + dy]
-        right_points[i] = [cx - dx, cy - dy]
+        # CarRacing's direction of travel is (-sin(beta), cos(beta)), so
+        # (cos(beta), sin(beta)) already points across the track, to the right.
+        dx = TRACK_WIDTH * math.cos(beta)
+        dy = TRACK_WIDTH * math.sin(beta)
+        left_points[i] = [cx - dx, cy - dy]
+        right_points[i] = [cx + dx, cy + dy]
 
     # Build segments: connect consecutive points, wrapping around for closed loop
     left_segs = np.stack([left_points, np.roll(left_points, -1, axis=0)], axis=1)
@@ -168,7 +181,20 @@ class LiDARWrapper(gym.ObservationWrapper):
         # Compute track boundaries for this episode's track
         track = self.unwrapped.track
         self.left_segs, self.right_segs = compute_track_boundaries(track)
+        self.centerline = np.array([[x, y] for _, _, x, y in track])
         return self.observation(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+        if self._off_track():
+            reward -= OFF_TRACK_PENALTY
+            terminated = True
+        return obs, reward, terminated, truncated, info
+
+    def _off_track(self):
+        car = self.unwrapped.car
+        pos = np.array([car.hull.position[0], car.hull.position[1]])
+        return np.linalg.norm(self.centerline - pos, axis=1).min() > TRACK_WIDTH
 
     def observation(self, obs):
         car = self.unwrapped.car
@@ -177,7 +203,7 @@ class LiDARWrapper(gym.ObservationWrapper):
 
         # Car state
         pos = np.array([car.hull.position[0], car.hull.position[1]])
-        angle = car.hull.angle
+        angle = car_heading(car)
         vel = car.hull.linearVelocity
         ang_vel = car.hull.angularVelocity
 
@@ -239,6 +265,29 @@ print(f"Observation range: [{obs.min():.3f}, {obs.max():.3f}]")
 print(f"Action space: {train_env.action_space}")
 print(f"\nSample observation:\n  LiDAR (first 10 rays): {obs[0, :10]}")
 print(f"  Car state [fwd_speed, lat_speed, ang_vel]: {obs[0, -3:]}")
+
+# ============================================================
+# Top-down check: rays should fan out ahead of the car and stop at the track edges
+# ============================================================
+check_env = LiDARWrapper(gym.make(ENV_ID, continuous=True))
+check_env.reset(seed=0)
+car = check_env.unwrapped.car
+pos = np.array([car.hull.position[0], car.hull.position[1]])
+heading = car_heading(car)
+dists = cast_lidar_rays(pos, heading, check_env.left_segs, check_env.right_segs)
+
+plt.figure(figsize=(7, 7))
+for segs, color in [(check_env.left_segs, "tab:blue"), (check_env.right_segs, "tab:orange")]:
+    plt.plot(segs[:, 0, 0], segs[:, 0, 1], color=color, lw=1)
+for a, d in zip(heading + LIDAR_ANGLES, dists):
+    plt.plot([pos[0], pos[0] + d * math.cos(a)], [pos[1], pos[1] + d * math.sin(a)], color="tab:green", lw=0.5)
+plt.plot(*pos, "ro")
+plt.xlim(pos[0] - 60, pos[0] + 60)
+plt.ylim(pos[1] - 60, pos[1] + 60)
+plt.gca().set_aspect("equal")
+plt.title("LiDAR rays (green) vs left (blue) / right (orange) track edges")
+plt.show()
+check_env.close()
 
 # ============================================================
 # PPO Model with MlpPolicy
@@ -339,12 +388,17 @@ def draw_lidar_on_frame(frame, car_pixel_pos, car_angle, distances):
     overlay = frame.copy()
     cx, cy = int(car_pixel_pos[0]), int(car_pixel_pos[1])
 
+    # The camera rotates with the car, so the car always points up in the frame
+    # and car_angle is not needed. CarRacing draws at ZOOM * SCALE = 16.2 px per
+    # world unit on a 1000x800 window, then resizes that to the output frame.
+    h, w = frame.shape[:2]
+    px_x = 16.2 * w / 1000
+    px_y = 16.2 * h / 800
+
     for i, (angle_offset, dist) in enumerate(zip(LIDAR_ANGLES, distances)):
-        world_angle = car_angle + angle_offset
-        # Scale distance to pixels (approximate: ~6.0 pixels per world unit at default zoom)
-        pixel_dist = dist * 6.0
-        ex = int(cx + pixel_dist * math.cos(world_angle))
-        ey = int(cy - pixel_dist * math.sin(world_angle))  # y is flipped in pixel coords
+        screen_angle = math.pi / 2 + angle_offset
+        ex = int(cx + dist * px_x * math.cos(screen_angle))
+        ey = int(cy - dist * px_y * math.sin(screen_angle))  # y is flipped in pixel coords
 
         # Color: red (close) -> yellow -> green (far)
         ratio = min(dist / LIDAR_MAX_RANGE, 1.0)
@@ -377,7 +431,7 @@ def record_video_with_lidar(model, env_id, max_steps=1000):
         car = render_env.unwrapped.car
         if car is not None:
             pos = np.array([car.hull.position[0], car.hull.position[1]])
-            angle = car.hull.angle
+            angle = car_heading(car)
             distances = cast_lidar_rays(pos, angle, lidar_env.left_segs, lidar_env.right_segs)
 
             # Convert car world position to pixel position in the frame
@@ -442,11 +496,12 @@ Input vector: {LIDAR_NUM_RAYS + 3} dimensions (float32, all in [0, 1])
 Indices [0:{LIDAR_NUM_RAYS}] — LiDAR ray distances:
   - {LIDAR_NUM_RAYS} rays spanning {np.degrees(LIDAR_FOV):.0f}° forward arc
   - Angular spacing: {np.degrees(LIDAR_ANGLES[1] - LIDAR_ANGLES[0]):.2f}°
-  - Ray order: left-to-right (index 0 = {np.degrees(LIDAR_ANGLES[0]):.1f}°, index {LIDAR_NUM_RAYS-1} = {np.degrees(LIDAR_ANGLES[-1]):.1f}°)
+  - Ray order: right-to-left (index 0 = {np.degrees(LIDAR_ANGLES[0]):.1f}° = right, index {LIDAR_NUM_RAYS-1} = {np.degrees(LIDAR_ANGLES[-1]):.1f}° = left)
   - Normalized: distance / {LIDAR_MAX_RANGE} (clip to [0, 1])
+  - Distances are in Box2D units: multiply metres by ~{UNITS_PER_METER} before normalizing
   - Real sensor: use every 4th beam from front 180 beams of 720-beam sensor
 
-Index [{LIDAR_NUM_RAYS}] — Forward speed:
+Index [{LIDAR_NUM_RAYS}] — Forward speed (Box2D units/s, so metres/s times ~{UNITS_PER_METER}):
   - speed / {MAX_SPEED} mapped to [0, 1] via: clip(speed/max, -1, 1) * 0.5 + 0.5
   - 0.5 = stationary, >0.5 = forward, <0.5 = reverse
 
@@ -455,6 +510,8 @@ Index [{LIDAR_NUM_RAYS + 1}] — Lateral speed:
 
 Index [{LIDAR_NUM_RAYS + 2}] — Angular velocity:
   - ang_vel / 5.0 mapped to [0, 1] via: clip(ang_vel/5, -1, 1) * 0.5 + 0.5
+
+Index [{LIDAR_NUM_RAYS + 1}] is positive to the left; index [{LIDAR_NUM_RAYS + 2}] is positive counter-clockwise.
 
 Output: 3 continuous actions
   - [0] Steering: [-1, 1] (left to right)
