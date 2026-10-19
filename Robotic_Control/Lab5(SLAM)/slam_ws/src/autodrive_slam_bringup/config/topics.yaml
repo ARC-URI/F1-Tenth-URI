@@ -47,7 +47,10 @@ autodrive_adapter_node:
 
     # ---- Vehicle geometry (F1TENTH default; edit if your car differs) ----
     wheelbase: 0.3302        # meters, distance between front and rear axles
-    max_steering_angle: 0.4189   # radians (~24 deg), F1TENTH default servo limit
+    max_steering_angle: 0.5236   # radians (30 deg): the simulated car's wheel angle at steering command 1.0 (measured)
     max_throttle: 1.0         # normalized AutoDRIVE throttle command range [-1, 1]
+    wheel_radius: 0.059       # meters, used to turn encoder angles into speed for /odom
+    speed_at_full_throttle: 3.7   # m/s the simulated car settles at with throttle 1.0 (measured)
+    drive_timeout: 0.5        # seconds without a /drive command before the adapter stops the car
 
     publish_tf: true

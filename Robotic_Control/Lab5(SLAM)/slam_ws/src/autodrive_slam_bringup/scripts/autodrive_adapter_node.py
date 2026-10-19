@@ -9,7 +9,9 @@ Responsibilities:
   1. Republish AutoDRIVE's LiDAR scan as a clean sensor_msgs/LaserScan on
      /scan (what slam_toolbox expects).
   2. Publish nav_msgs/Odometry on /odom (+ TF odom -> base_link) directly
-     from AutoDRIVE's ground-truth IPS position and IMU orientation. This
+     from AutoDRIVE's ground-truth IPS position and IMU orientation, with
+     forward speed from the wheel encoders and yaw rate from the IMU in the
+     twist (the same fields the real car's VESC odometry fills in). This
      is a simulator, and AutoDRIVE explicitly provides ground-truth pose
      for this reason -- using it sidesteps dead-reckoning drift entirely,
      and (unlike integrating commanded throttle/steering) it tracks the
@@ -26,12 +28,18 @@ install uses different topic names.
 """
 
 import math
+import signal
+import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.signals import SignalHandlerOptions
 
-from sensor_msgs.msg import LaserScan, Imu
+from collections import deque
+
+from sensor_msgs.msg import LaserScan, Imu, JointState
+from rclpy.time import Time
 from std_msgs.msg import Float32
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TransformStamped, Point
@@ -47,6 +55,8 @@ class AutoDriveAdapterNode(Node):
         self.declare_parameter('autodrive_lidar_topic', '/autodrive/f1tenth_1/lidar')
         self.declare_parameter('autodrive_imu_topic', '/autodrive/f1tenth_1/imu')
         self.declare_parameter('autodrive_ips_topic', '/autodrive/f1tenth_1/ips')
+        self.declare_parameter('autodrive_left_encoder_topic', '/autodrive/f1tenth_1/left_encoder')
+        self.declare_parameter('autodrive_right_encoder_topic', '/autodrive/f1tenth_1/right_encoder')
 
         self.declare_parameter('autodrive_throttle_topic', '/autodrive/f1tenth_1/throttle_command')
         self.declare_parameter('autodrive_steering_topic', '/autodrive/f1tenth_1/steering_command')
@@ -61,6 +71,9 @@ class AutoDriveAdapterNode(Node):
 
         self.declare_parameter('max_steering_angle', 0.4189)
         self.declare_parameter('max_throttle', 1.0)
+        self.declare_parameter('wheel_radius', 0.059)
+        self.declare_parameter('speed_at_full_throttle', 3.7)
+        self.declare_parameter('drive_timeout', 0.5)
         self.declare_parameter('publish_tf', True)
 
         gp = self.get_parameter
@@ -81,12 +94,20 @@ class AutoDriveAdapterNode(Node):
 
         self.max_steering_angle = float(gp('max_steering_angle').value)
         self.max_throttle = float(gp('max_throttle').value)
+        self.wheel_radius = float(gp('wheel_radius').value)
+        self.speed_at_full_throttle = float(gp('speed_at_full_throttle').value)
+        self.drive_timeout = float(gp('drive_timeout').value)
+        self.last_drive_time = None     # s, when the last /drive command arrived
         self.publish_tf = bool(gp('publish_tf').value)
 
         # ---------------- State: latest ground-truth pose from AutoDRIVE ----------------
         self.origin = None              # (x0, y0) -- first IPS reading, so odom starts at 0,0
         self.latest_position = None     # geometry_msgs/Point, world frame
         self.latest_orientation = None  # geometry_msgs/Quaternion, from IMU
+        self.yaw_rate = 0.0             # rad/s, from IMU
+        self.speed = 0.0                # m/s forward, from wheel encoders
+        self.left_angle = None          # rad, latest left encoder reading
+        self.wheel_history = deque()    # (time in s, mean wheel angle in rad) over the last ~0.6 s
 
         # ---------------- QoS ----------------
         sensor_qos = QoSProfile(
@@ -119,12 +140,20 @@ class AutoDriveAdapterNode(Node):
         self.create_subscription(LaserScan, self.lidar_topic, self.on_lidar, sensor_qos)
         self.create_subscription(Point, self.ips_topic, self.on_ips, sensor_qos)
         self.create_subscription(Imu, self.imu_topic, self.on_imu, sensor_qos)
+        self.create_subscription(
+            JointState, gp('autodrive_left_encoder_topic').value, self.on_left_encoder, sensor_qos)
+        self.create_subscription(
+            JointState, gp('autodrive_right_encoder_topic').value, self.on_right_encoder, sensor_qos)
 
         # ---------------- Subscriber: drive commands (standard Ackermann message) ----------------
         self.create_subscription(AckermannDriveStamped, self.drive_topic, self.on_drive_cmd, 10)
 
         # ---------------- TF broadcaster ----------------
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+
+        # The AutoDRIVE bridge keeps applying the last throttle it received, so
+        # stop the car ourselves when /drive commands stop arriving.
+        self.create_timer(0.1, self.drive_watchdog)
 
         # Publish odometry at a fixed rate from the latest ground-truth pose.
         self.odom_timer = self.create_timer(0.02, self.publish_odometry)  # 50 Hz
@@ -158,6 +187,29 @@ class AutoDriveAdapterNode(Node):
 
     def on_imu(self, msg: Imu):
         self.latest_orientation = msg.orientation
+        self.yaw_rate = msg.angular_velocity.z
+
+    # -------------------------------------------------------------------
+    # Forward speed from the wheel encoders
+    # -------------------------------------------------------------------
+    def on_left_encoder(self, msg: JointState):
+        self.left_angle = msg.position[0]
+
+    def on_right_encoder(self, msg: JointState):
+        # The bridge publishes left then right from the same simulator sample.
+        if self.left_angle is None:
+            return
+        t = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        angle = 0.5 * (self.left_angle + msg.position[0])
+        # Samples arrive slowly and unevenly spaced, so difference over a
+        # window instead of consecutive samples.
+        history = self.wheel_history
+        history.append((t, angle))
+        while len(history) > 2 and t - history[1][0] >= 0.6:
+            history.popleft()
+        t0, angle0 = history[0]
+        if t - t0 > 1e-3:
+            self.speed = self.wheel_radius * (angle - angle0) / (t - t0)
 
     # -------------------------------------------------------------------
     # Drive command -> AutoDRIVE throttle/steering commands
@@ -169,13 +221,27 @@ class AutoDriveAdapterNode(Node):
         # Clamp to physical steering limits.
         steering_angle = max(-self.max_steering_angle, min(self.max_steering_angle, steering_angle))
 
-        # AutoDRIVE expects normalized commands in [-1, 1]. Throttle scaling
-        # here is intentionally simple (linear); tune to taste / vehicle dynamics.
-        throttle_cmd = max(-self.max_throttle, min(self.max_throttle, speed))
+        # AutoDRIVE expects normalized commands in [-1, 1], and its throttle
+        # acts as a speed setpoint: the car settles at about
+        # speed_at_full_throttle * throttle within ~0.3 s.
+        throttle_cmd = speed / self.speed_at_full_throttle
+        throttle_cmd = max(-self.max_throttle, min(self.max_throttle, throttle_cmd))
         steering_cmd = steering_angle / self.max_steering_angle  # -> [-1, 1]
 
         self.throttle_pub.publish(Float32(data=float(throttle_cmd)))
         self.steering_pub.publish(Float32(data=float(steering_cmd)))
+        self.last_drive_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def drive_watchdog(self):
+        if self.last_drive_time is None:
+            return
+        if self.get_clock().now().nanoseconds * 1e-9 - self.last_drive_time > self.drive_timeout:
+            self.stop_vehicle()
+            self.last_drive_time = None
+
+    def stop_vehicle(self):
+        self.throttle_pub.publish(Float32(data=0.0))
+        self.steering_pub.publish(Float32(data=0.0))
 
     # -------------------------------------------------------------------
     # Odometry from AutoDRIVE's ground-truth IPS position + IMU orientation
@@ -198,6 +264,8 @@ class AutoDriveAdapterNode(Node):
         odom_msg.pose.pose.position.y = y
         odom_msg.pose.pose.position.z = 0.0
         odom_msg.pose.pose.orientation = self.latest_orientation
+        odom_msg.twist.twist.linear.x = self.speed
+        odom_msg.twist.twist.angular.z = self.yaw_rate
 
         self.odom_pub.publish(odom_msg)
 
@@ -213,16 +281,27 @@ class AutoDriveAdapterNode(Node):
             self.tf_broadcaster.sendTransform(t)
 
 
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main(args=None):
-    rclpy.init(args=args)
+    # Handle Ctrl+C and termination ourselves so the stop command below still goes out.
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    signal.signal(signal.SIGINT, _raise_interrupt)
+    signal.signal(signal.SIGTERM, _raise_interrupt)
     node = AutoDriveAdapterNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        # Repeat briefly: a single message sent just before exit can be lost.
+        for _ in range(5):
+            node.stop_vehicle()
+            time.sleep(0.05)
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

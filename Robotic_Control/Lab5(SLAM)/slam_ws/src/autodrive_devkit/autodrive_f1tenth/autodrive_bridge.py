@@ -52,6 +52,22 @@ import autodrive_f1tenth.config as config # AutoDRIVE Ecosystem ROS 2 configurat
 
 ################################################################################
 
+# gevent-websocket unmasks and UTF-8 validates every frame byte by byte in pure
+# Python. The simulator sends ~160 KB per message (it includes a camera frame),
+# which cost ~140 ms each and held the whole bridge to ~3 Hz.
+import geventwebsocket.websocket as _gws
+
+def _fast_mask_payload(self, payload):
+    data = np.frombuffer(payload, dtype=np.uint8)
+    key = np.frombuffer((bytes(self.mask) * (len(data) // 4 + 1))[:len(data)], dtype=np.uint8)
+    return bytearray(data ^ key)
+
+_gws.Header.mask_payload = _fast_mask_payload
+_gws.Header.unmask_payload = _fast_mask_payload
+_gws.WebSocket.validate_utf8 = lambda self, payload: None # Invalid UTF-8 still raises when the message is decoded
+
+################################################################################
+
 # AutoDRIVE class
 class AutoDRIVE:
     def __init__(self):
